@@ -1,0 +1,14 @@
+# Entorno virtual de Python (no subir al repositorio)
+.venv/
+
+# Archivos compilados de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Carpeta de capturas de ejemplo (datos generados por el usuario)
+capturas/
+
+# Archivos temporales del sistema
+.DS_Store
+Thumbs.db
