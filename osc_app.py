@@ -30,6 +30,7 @@ from matplotlib.figure import Figure
 
 import theme
 from fft_analysis import FFTAnalyzer, FFTResult, WINDOWS
+from lc_measurement import LCMeasurement, measure_resonance, estimate_q_factor
 from rigol_scope import (
     DEFAULT_TIMEOUT_MS,
     DemoScope,
@@ -534,6 +535,13 @@ class OScopeApp(tk.Tk):
         self.fft_use_db = tk.BooleanVar(value=True)
         self.fft_result: Optional[FFTResult] = None
 
+        # -- Medidor L/C ----------------------------------------------------
+        self.lc_mode = tk.StringVar(value="L")
+        self.lc_known_value = tk.StringVar(value="100e-9")
+        self.lc_channel = tk.StringVar(value="CH1")
+        self.lc_threshold = tk.StringVar(value="0.10")
+        self.lc_result: Optional[LCMeasurement] = None
+
     # -- interfaz ------------------------------------------------------------
 
     def _build_ui(self):
@@ -551,6 +559,7 @@ class OScopeApp(tk.Tk):
         self._build_screen_tab()
         self._build_console_tab()
         self._build_fft_tab()
+        self._build_lc_tab()
         self._build_statusbar()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1136,6 +1145,295 @@ class OScopeApp(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Error al guardar", str(exc))
 
+    # -- pestaña Medidor L/C -----------------------------------------------
+
+    def _build_lc_tab(self):
+        tab = ttk.Frame(self.notebook, style="Bg.TFrame", padding=8)
+        self.notebook.add(tab, text="  Medidor L/C  ")
+        tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        # Panel de controles ------------------------------------------------
+        left = ttk.Frame(tab, style="Panel.TFrame", padding=10, width=320)
+        left.grid(row=0, column=0, sticky="nsw", padx=(0, 10))
+        left.grid_propagate(False)
+        left.columnconfigure(1, weight=1)
+
+        ttk.Label(left, text="Medidor de Inductancia / Capacitancia",
+                  style="Heading.TLabel").grid(row=0, column=0, columnspan=2,
+                                               sticky="w", pady=(0, 6))
+        ttk.Label(left, text="Mide la frecuencia de resonancia del circuito tanque "
+                             "LC y calcula L o C usando la captura del osciloscopio.",
+                  style="Hint.TLabel", wraplength=280, justify="left").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        # Qué medir
+        mode_frame = ttk.Frame(left, style="Panel.TFrame")
+        mode_frame.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(mode_frame, text="Medir:", style="Muted.TLabel").pack(side="left")
+        ttk.Radiobutton(mode_frame, text="Inductancia L (C conocida)",
+                        value="L", variable=self.lc_mode).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(mode_frame, text="Capacitancia C (L conocida)",
+                        value="C", variable=self.lc_mode).pack(side="left", padx=(8, 0))
+
+        self._row(left, 3, "Valor conocido", self._entry(left, self.lc_known_value))
+        unit_row = ttk.Frame(left, style="Panel.TFrame")
+        unit_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(unit_row, text="Unidad:", style="Muted.TLabel").pack(side="left")
+        self.lc_unit_combo = ttk.Combobox(unit_row, textvariable=tk.StringVar(value="nF"),
+                                          values=("nF", "µF", "mF", "F", "nH", "µH", "mH", "H"),
+                                          width=8, state="readonly")
+        self.lc_unit_combo.pack(side="left", padx=(6, 0))
+        self.lc_unit_combo.bind("<<ComboboxSelected>>", self._on_lc_unit_change)
+        # Sincronizar unidad inicial con el modo.
+        self._on_lc_unit_change()
+
+        self._row(left, 5, "Canal", self._combo(left, self.lc_channel, ("CH1", "CH2")))
+        self._row(left, 6, "Umbral de detección", self._entry(left, self.lc_threshold))
+        ttk.Label(left, text="Fracción del pico absoluto para aceptar un pico (0.05–0.5).",
+                  style="Hint.TLabel", wraplength=280, justify="left").grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        self._add_action(
+            ttk.Button(left, text="Capturar y medir", command=self.on_lc_measure,
+                       style="Accent.TButton"),
+            row=8, column=0, columnspan=2, sticky="ew", pady=2)
+        self._add_action(
+            ttk.Button(left, text="Guardar medición CSV", command=self.on_lc_save_csv),
+            row=9, column=0, columnspan=2, sticky="ew", pady=2)
+
+        self.lc_status = ttk.Label(left, text="Listo", style="Muted.TLabel",
+                                   wraplength=280, justify="left")
+        self.lc_status.grid(row=10, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        # Panel de resultados -----------------------------------------------
+        right = ttk.Frame(tab, style="Panel.TFrame")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        ttk.Label(right, text="Oscilación amortiguada (circuito tanque)",
+                  style="Heading.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        plotframe = ttk.Frame(right, style="Panel.TFrame")
+        plotframe.grid(row=1, column=0, sticky="nsew")
+        plotframe.rowconfigure(0, weight=1)
+        plotframe.columnconfigure(0, weight=1)
+
+        self.lc_fig = Figure(figsize=(7.5, 4.2), dpi=100)
+        theme.style_figure(self.lc_fig)
+        self.lc_ax = self.lc_fig.add_subplot(111)
+        self.lc_fig.subplots_adjust(left=0.09, right=0.985, top=0.92, bottom=0.16)
+        theme.style_axes(self.lc_ax, xlabel="Tiempo (s)", ylabel="Tensión (V)")
+        self.lc_canvas = FigureCanvasTkAgg(self.lc_fig, master=plotframe)
+        self.lc_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._draw_lc_placeholder()
+
+        # Tabla de resultados -----------------------------------------------
+        res_frame = ttk.Frame(right, style="Panel.TFrame", padding=4)
+        res_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        res_frame.columnconfigure(1, weight=1)
+
+        rows = [
+            ("fr (resonancia)", "fr_value"),
+            ("Periodo", "period_value"),
+            (f"{'L' if self.lc_mode.get() == 'C' else 'C'} calculado", "result_value"),
+            ("Calidad (0..1)", "quality_value"),
+            ("Picos detectados", "peaks_value"),
+        ]
+        self.lc_labels = {}
+        for i, (label, key) in enumerate(rows):
+            ttk.Label(res_frame, text=label, style="Muted.TLabel").grid(
+                row=i, column=0, sticky="w", pady=1)
+            val_lbl = ttk.Label(res_frame, text="—", style="Value.TLabel")
+            val_lbl.grid(row=i, column=1, sticky="e", pady=1)
+            self.lc_labels[key] = val_lbl
+
+    # -- lógica Medidor L/C -------------------------------------------------
+
+    def _on_lc_unit_change(self, _event=None):
+        mode = self.lc_mode.get()
+        if mode == "L":
+            # Se mide L, conocido es C → unidades de faradios
+            units = ("pF", "nF", "µF", "mF", "F")
+            default = "nF"
+        else:
+            # Se mide C, conocido es L → unidades de henrios
+            units = ("pH", "nH", "µH", "mH", "H")
+            default = "µH"
+        try:
+            self.lc_unit_combo.configure(values=units)
+            if self.lc_unit_combo.get() not in units:
+                self.lc_unit_combo.set(default)
+        except tk.TclError:
+            pass
+
+    def _si_to_unit(self, value: float, unit: str) -> float:
+        """Convierte un valor SI a la unidad dada."""
+        factors = {
+            "pF": 1e12, "nF": 1e9, "µF": 1e6, "mF": 1e3, "F": 1.0,
+            "pH": 1e12, "nH": 1e9, "µH": 1e6, "mH": 1e3, "H": 1.0,
+        }
+        return value * factors.get(unit, 1.0)
+
+    def _unit_to_si(self, value: float, unit: str) -> float:
+        factors = {
+            "pF": 1e-12, "nF": 1e-9, "µF": 1e-6, "mF": 1e-3, "F": 1.0,
+            "pH": 1e-12, "nH": 1e-9, "µH": 1e-6, "mH": 1e-3, "H": 1.0,
+        }
+        return value * factors.get(unit, 1.0)
+
+    def on_lc_measure(self):
+        if self.last_waveform is None:
+            messagebox.showinfo(
+                "Sin datos",
+                "Captura primero una forma de onda del circuito tanque en la pestaña "
+                "Captura (usa modo Memoria y canal donde tengas el LC conectado).")
+            return
+
+        try:
+            known_val = float(self.lc_known_value.get().replace(",", "."))
+        except (ValueError, AttributeError, tk.TclError):
+            messagebox.showerror("Valor no válido", "Revisa el valor conocido.")
+            return
+        try:
+            threshold = float(self.lc_threshold.get().replace(",", "."))
+            if not 0.01 <= threshold <= 0.9:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Valor no válido", "El umbral debe estar entre 0.01 y 0.9.")
+            return
+
+        if known_val <= 0:
+            messagebox.showerror("Valor no válido", "El valor conocido debe ser mayor que cero.")
+            return
+
+        unit = self.lc_unit_combo.get() if hasattr(self, "lc_unit_combo") else "nF"
+        known_si = self._unit_to_si(known_val, unit)
+        mode = self.lc_mode.get()  # "L" o "C"
+
+        self.set_busy(True)
+        self.lc_status.configure(text="Analizando resonancia…")
+        wf = self.last_waveform
+
+        def job():
+            try:
+                result = measure_resonance(
+                    wf.time_s, wf.volts,
+                    known_component=mode,
+                    known_value=known_si,
+                    threshold_frac=threshold,
+                    min_cycles=2,
+                )
+                self.events.put(("lc_result", result))
+            except Exception as exc:
+                self.events.put(("lc_error", str(exc)))
+            finally:
+                self.events.put(("busy", False))
+
+        self.worker.submit(job)
+
+    def _handle_lc_result(self, result: LCMeasurement):
+        self.lc_result = result
+        if result.error:
+            self.lc_status.configure(text="Error: " + result.error)
+            self.log(f"LC medidor: {result.error}")
+            for key in ("fr_value", "period_value", "result_value", "quality_value", "peaks_value"):
+                self.lc_labels[key].configure(text="—")
+            self._draw_lc_placeholder()
+            return
+
+        self.lc_labels["fr_value"].configure(text=result.formatted_freq())
+        self.lc_labels["period_value"].configure(
+            text=f"{result.period_s*1e6:.4g} µs" if result.period_s else "—")
+        self.lc_labels["result_value"].configure(
+            text=result.formatted_result(prefix=True))
+        self.lc_labels["quality_value"].configure(
+            text=f"{result.quality:.3f}" if result.quality is not None else "—")
+        self.lc_labels["peaks_value"].configure(text=str(result.peak_count))
+
+        known_name = "C" if result.known_component == "C" else "L"
+        known_si = result.known_value
+        unit = self.lc_unit_combo.get() if hasattr(self, "lc_unit_combo") else "nF"
+        known_disp = known_si / self._si_to_unit(1.0, unit)
+        self.lc_status.configure(
+            text=f"{known_name} = {known_disp:.4g} {unit} · fr = {result.formatted_freq()} · "
+                 f"resultado = {result.formatted_result(prefix=True)}")
+        self.log(
+            f"LC medidor: {known_name}={known_disp:.4g} {unit}, fr={result.resonance_freq_hz:.2f} Hz, "
+            f"resultado={result.formatted_result()}, picos={result.peak_count}, calidad={result.quality}")
+
+        self._plot_lc(wf, result)
+
+    def _handle_lc_error(self, msg: str):
+        self.lc_status.configure(text="Error: " + msg)
+        self.log(f"LC medidor error: {msg}")
+        set_busy = getattr(self, "set_busy", None)
+        if set_busy:
+            set_busy(False)
+
+    def _draw_lc_placeholder(self):
+        self.lc_ax.clear()
+        theme.style_axes(self.lc_ax, xlabel="Tiempo (s)", ylabel="Tensión (V)")
+        self.lc_ax.text(0.5, 0.5, "Sin medición\nExcita el circuito tanque y pulsa «Capturar y medir»",
+                        transform=self.lc_ax.transAxes, ha="center", va="center",
+                        fontsize=11, color=C["disabled"])
+        self.lc_canvas.draw_idle()
+
+    def _plot_lc(self, wf, result: LCMeasurement):
+        self.lc_ax.clear()
+        theme.style_axes(self.lc_ax, xlabel="Tiempo (s)", ylabel="Tensión (V)")
+        t = wf.time_s
+        v = wf.volts
+        self.lc_ax.plot(t, v, color=C["ch2"] if "2" in wf.channel else C["ch1"],
+                        linewidth=0.8, label="Captura")
+        if result.peaks:
+            # Graficar picos detectados.
+            peak_v = np.interp(result.peaks, t, v)
+            self.lc_ax.plot(result.peaks, peak_v, "o", color=C["ch1"], markersize=4,
+                            label="Picos detectados")
+        self.lc_ax.set_title(
+            f"LC resonancia · fr = {result.formatted_freq()} · "
+            f"{'L' if result.known_component == 'C' else 'C'} = {result.formatted_result()}",
+            fontsize=9, loc="right")
+        self.lc_ax.legend(fontsize=7, loc="upper right")
+        self.lc_canvas.draw_idle()
+
+    def on_lc_save_csv(self):
+        if self.lc_result is None or self.lc_result.error:
+            messagebox.showinfo("Sin datos", "No hay ninguna medición L/C para guardar.")
+            return
+        os.makedirs(CAPTURE_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = filedialog.asksaveasfilename(
+            title="Guardar medición L/C como CSV", initialdir=CAPTURE_DIR,
+            initialfile=f"lc_medicion_{stamp}.csv", defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Todos los archivos", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                fh.write("# Rigol DS1202Z-E medicion de resonancia LC\n")
+                fh.write(f"# componente_conocido={self.lc_result.known_component}\n")
+                fh.write(f"# valor_conocido={self.lc_result.known_value:.12e}\n")
+                fh.write(f"# frecuencia_resonancia_hz={self.lc_result.resonance_freq_hz:.12e}\n")
+                fh.write(f"# periodo_s={self.lc_result.period_s:.12e}\n")
+                fh.write(f"# calidad={self.lc_result.quality}\n")
+                fh.write(f"# picos_detectados={self.lc_result.peak_count}\n")
+                if self.lc_result.inductance_h is not None:
+                    fh.write(f"# inductancia_calculada_H={self.lc_result.inductance_h:.12e}\n")
+                if self.lc_result.capacitance_f is not None:
+                    fh.write(f"# capacitancia_calculada_F={self.lc_result.capacitance_f:.12e}\n")
+                fh.write("# pico_t_s,pico_V,periodo_s\n")
+                periods = self.lc_result.periods or []
+                for i, pt in enumerate(self.lc_result.peaks):
+                    pv = self.lc_result.peak_voltages[i] if i < len(self.lc_result.peak_voltages) else ""
+                    per = periods[i] if i < len(periods) else ""
+                    fh.write(f"{pt:.12e},{pv},{per}\n")
+            self.log(f"Medición L/C guardada: {path}")
+        except Exception as exc:
+            messagebox.showerror("Error al guardar", str(exc))
+
     # -- helpers de widgets --------------------------------------------------
 
     def _section(self, parent, title):
@@ -1281,6 +1579,10 @@ class OScopeApp(tk.Tk):
             self.set_busy(bool(payload))
         elif kind == "result":
             self._handle_result(payload)
+        elif kind == "lc_result":
+            self._handle_lc_result(payload)
+        elif kind == "lc_error":
+            self._handle_lc_error(payload)
         elif kind == "screenshot":
             self._show_screenshot(payload)
 

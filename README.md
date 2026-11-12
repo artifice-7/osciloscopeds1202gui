@@ -11,6 +11,11 @@ Además incluye:
 - **Pestaña Análisis FFT**: espectro de magnitud de la última captura con
   ventanas (Hann, Hamming, Blackman, Bartlett, Flat-top, Ninguna), detección de
   picos, frecuencia fundamental, SNR estimado y guardado a CSV.
+- **Pestaña Medidor L/C**: mide la frecuencia de resonancia de un circuito tanque
+  LC capturado en el osciloscopio y calcula la inductancia (L) o la capacitancia
+  (C) usando la fórmula de resonancia \(f_r = \frac{1}{2\pi\sqrt{L\cdot C}}\).
+  Incluye detección automática de picos de la oscilación amortiguada, estimación
+  del factor de calidad Q y guardado a CSV.
 
 La referencia de comandos utilizada está en
 `Documentation/Rigol DS1202Z-E SCPI Commands Reference _ bootloop.html`.
@@ -117,6 +122,59 @@ Opciones principales: `--resource`, `--channel CH1|CH2`, `--mode screen|memory`,
 `--points N`, `--format BYTE|WORD`, `--no-single`, `--csv`, `--npz`, `--png`,
 `--scpi-meas`, `--outdir`.
 
+### Medición de inductancia/capacitancia (pestaña Medidor L/C)
+
+La pestaña **Medidor L/C** permite calcular una inductancia desconocida o una
+capacitancia desconocida a partir de la frecuencia de resonancia de un circuito
+tanque LC capturado en el osciloscopio.
+
+Fórmula de resonancia:
+
+$$f_r = \frac{1}{2\pi\sqrt{L\cdot C}}$$
+
+Despejes implementados:
+
+$$L = \frac{1}{4\pi^2 f_r^2 C} \qquad C = \frac{1}{4\pi^2 f_r^2 L}$$
+
+**Procedimiento práctico:**
+
+1. Arma el circuito tanque (inductor en paralelo con capacitor) y conéctalo a
+   la entrada del osciloscopio (por ejemplo, CH1).
+2. Conoce o mide previamente uno de los dos componentes (p. ej. el capacitor
+   de 100 nF con un capacímetro).
+3. Excita el circuito con un pulso o escalón de tensión para generar
+   oscilaciones amortiguadas.
+4. En la pestaña **Captura**, selecciona el canal, modo **Memoria** y pulsa
+   **Capturar (F5)**.
+5. Ve a la pestaña **Medidor L/C**:
+   - Elige qué medir (**Inductancia L** si conoces C, o **Capacitancia C** si
+     conoces L).
+   - Escribe el valor conocido y su unidad (p. ej. `100` en `nF`).
+   - Ajusta el umbral de detección de picos si es necesario (0.01–0.9).
+   - Pulsa **Capturar y medir**.
+6. El programa detecta los picos de la oscilación amortiguada, estima la
+   frecuencia de resonancia y calcula el componente desconocido, mostrando
+   también la calidad de la medición y el número de picos detectados.
+7. Pulsa **Guardar medición CSV** para exportar los resultados.
+
+
+# Captura de pantalla (1200 puntos) a CSV + PNG
+.venv\Scripts\python.exe capture.py --channel CH1 --mode screen --csv --png
+
+# Memoria completa (hasta la profundidad máxima del instrumento) a NPZ
+.venv\Scripts\python.exe capture.py --channel CH2 --mode memory --npz
+
+# Recortar a 1 200 000 puntos, formato WORD y medidas del osciloscopio
+.venv\Scripts\python.exe capture.py --mode memory --points 1200000 --format WORD --scpi-meas
+
+# Sin hardware (traza simulada)
+.venv\Scripts\python.exe capture.py --demo --png
+```
+
+Opciones principales: `--resource`, `--channel CH1|CH2`, `--mode screen|memory`,
+`--points N`, `--format BYTE|WORD`, `--no-single`, `--csv`, `--npz`, `--png`,
+`--scpi-meas`, `--outdir`.
+
 ---
 
 ## 3. Archivos del proyecto
@@ -127,6 +185,7 @@ Opciones principales: `--resource`, `--channel CH1|CH2`, `--mode screen|memory`,
 | `osc_app.py` | Aplicación gráfica (Tkinter + Matplotlib) con pestañas, tema oscuro y análisis FFT. |
 | `capture.py` | Capturador por línea de comandos. |
 | `fft_analysis.py` | Motor de análisis FFT (ventanas, detección de picos, fundamental, SNR). |
+| `lc_measurement.py` | Motor de medición LC: detección de resonancia, cálculo de L/C, factor Q. |
 | `theme.py` | Paleta oscura y estilos ttk/Tk/Matplotlib. |
 | `scpi_catalog.py` | Parser automático de la referencia HTML → 393 comandos SCPI con parámetros. |
 | `bootstrap.py` | Relanza el programa con el Python del entorno virtual si faltan dependencias. |
